@@ -3,3 +3,4 @@ pymongo
 pandas
 plotly
 requests
+st-pages
