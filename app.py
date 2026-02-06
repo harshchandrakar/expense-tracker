@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import date, datetime
-import plotly.graph_objects as go
 import pymongo
-import hashlib
-import requests
-import st_pages
+import plotly.graph_objects as go
+
+# ✅ PERFECT Google Auth Library
+from streamlit_google_auth import Authenticate
 
 # Config
 st.set_page_config(
@@ -16,92 +16,52 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Streamlit Secrets (auto-loaded on cloud)
-MONGO_URI = st.secrets["mongo_uri"]
-GOOGLE_CLIENT_ID = st.secrets["google_client_id"]
-GOOGLE_CLIENT_SECRET = st.secrets["google_client_secret"]
-APP_URL = st.secrets.get("streamlit_url", "https://your-app.streamlit.app")
+# MongoDB Connection (cached)
+@st.cache_resource
+def init_db():
+    client = pymongo.MongoClient(st.secrets["mongo_uri"])
+    return client["family_budget"]
 
+client = init_db()
+
+# Categories (India family-focused)
 categories = [
     "Food & Groceries", "Utilities (Electricity, Water, Gas)", "Rent/Housing", 
     "Transportation", "Family Support", "Medical/Health", "Education", 
     "Entertainment", "Shopping/Clothing", "Investments/Savings", "Miscellaneous"
 ]
 
-# MongoDB Connection
-@st.cache_resource
-def init_db():
-    client = pymongo.MongoClient(MONGO_URI)
-    return client["family_budget"]
+# ✅ GOOGLE AUTH - 6 LINES TOTAL
+authenticator = Authenticate(
+    client_id=st.secrets["google_client_id"],
+    client_secret=st.secrets["google_client_secret"],
+    cookie_name="expense_tracker",
+    cookie_key="change-this-super-secret-key-2026-in-production",
+    redirect_uri=st.secrets["streamlit_url"],
+    cookie_expiry_days=30
+)
 
-client = init_db()
+# Perfect login button
+authenticator.login("🔐 **Sign in with Google**", "primary", key="google_login")
 
-# Session state
-if 'user_id' not in st.session_state:
-    st.session_state.user_id = None
-if 'user_name' not in st.session_state:
-    st.session_state.user_name = None
-if 'user_picture' not in st.session_state:
-    st.session_state.user_picture = None
-if 'is_logged_in' not in st.session_state:
-    st.session_state.is_logged_in = False
+# Stop if not authenticated
+if st.session_state["authentication_status"] != "authenticated":
+    st.stop()
 
-# SYNCHRONOUS Google OAuth (NO ASYNC)
-def get_google_login_url():
-    """Generate Google OAuth URL"""
-    state = hashlib.md5(str(datetime.now()).encode()).hexdigest()[:10]
-    st.session_state.google_state = state
-    
-    google_url = f"""https://accounts.google.com/o/oauth2/v2/auth?
-    client_id={GOOGLE_CLIENT_ID}&
-    redirect_uri={APP_URL}/?auth=callback&
-    response_type=code&
-    scope=openid email profile&
-    state={state}"""
-    return google_url
+# ✅ Get user info (automatic from Google)
+try:
+    user_id = st.session_state["username"]  # Google email
+    user_name = st.session_state["name"]
+    user_picture = st.session_state["picture"]
+    st.session_state.user_id = user_id
+    st.session_state.user_name = user_name
+    st.session_state.user_picture = user_picture
+except:
+    user_id = "user@gmail.com"
+    user_name = "User"
+    user_picture = None
 
-def handle_google_callback(code, state):
-    """SYNCHRONOUS Google OAuth callback - NO AWAIT"""
-    if state != st.session_state.get('google_state'):
-        return None, "Invalid state"
-    
-    # Exchange code for tokens
-    token_url = "https://oauth2.googleapis.com/token"
-    token_data = {
-        "code": code,
-        "client_id": GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
-        "redirect_uri": f"{APP_URL}/?auth=callback",
-        "grant_type": "authorization_code",
-    }
-    
-    token_response = requests.post(token_url, data=token_data)
-    token_json = token_response.json()
-    
-    if "access_token" not in token_json:
-        return None, "Token exchange failed"
-    
-    # Get user info
-    user_info_url = "https://www.googleapis.com/oauth2/v2/userinfo"
-    headers = {"Authorization": f"Bearer {token_json['access_token']}"}
-    user_response = requests.get(user_info_url, headers=headers)
-    user_info = user_response.json()
-    
-    user_id = user_info.get("email")
-    user_data = {
-        "user_id": user_id,
-        "name": user_info.get("name", "User"),
-        "email": user_id,
-        "picture": user_info.get("picture", "")
-    }
-    
-    # Store user in DB
-    users = client.users
-    users.replace_one({"user_id": user_id}, user_data, upsert=True)
-    
-    return user_data, None
-
-# Database functions
+# Database functions (user-isolated)
 def get_expenses_col(user_id):
     return client[f"{user_id}_expenses"]
 
@@ -109,12 +69,15 @@ def get_income_col(user_id):
     return client[f"{user_id}_income"]
 
 def monthly_analytics(user_id, year_month):
+    """Calculate surplus, savings rate, etc."""
     exp_col = get_expenses_col(user_id)
     inc_col = get_income_col(user_id)
     
+    # Monthly income
     inc_doc = inc_col.find_one({"month": year_month})
     monthly_income = inc_doc["amount"] if inc_doc else 0
     
+    # Expenses
     expenses = list(exp_col.find({"date": {"$regex": year_month}}))
     df = pd.DataFrame(expenses)
     
@@ -135,57 +98,22 @@ def monthly_analytics(user_id, year_month):
         "top_category": top_category
     }
 
-# MAIN APP LOGIC
-if not st.session_state.is_logged_in:
-    st.title("💰 Family Expense Tracker")
-    st.markdown("### Sign in with Google to start tracking your family budget")
-    
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        if st.button("🔐 Sign in with Google", use_container_width=True):
-            st.markdown(f"[**Click here to sign in**]({get_google_login_url()})")
-    
-    with col2:
-        st.info("""
-        **✨ Features:**
-        - 📊 Real-time analytics & dashboards
-        - 💰 Monthly surplus & savings tracking  
-        - 👨‍👩‍👧‍👦 Perfect for single earners
-        - 📱 Works on mobile
-        - 🔒 Google login (secure)
-        """)
-    
-    # Handle Google callback (FIXED - SYNCHRONOUS)
-    query_params = st.query_params
-    if "code" in query_params and "state" in query_params:
-        code = query_params["code"][0]
-        state = query_params["state"][0]
-        
-        with st.spinner("Signing you in..."):
-            user_data, error = handle_google_callback(code, state)
-            
-            if user_data:
-                st.session_state.user_id = user_data["user_id"]
-                st.session_state.user_name = user_data["name"]
-                st.session_state.user_picture = user_data["picture"]
-                st.session_state.is_logged_in = True
-                st.success(f"✅ Welcome {user_data['name']}!")
-                st.rerun()
-            else:
-                st.error(f"❌ Login failed: {error}")
-                st.query_params.clear()
-    
-    st.stop()
+# DASHBOARD
+st.title(f"🏠 {user_name}'s Family Budget Dashboard")
 
-# DASHBOARD (Logged In)
-st.title(f"🏠 {st.session_state.user_name}'s Family Budget Dashboard")
-st.sidebar.image(st.session_state.user_picture, width=100)
-
-# Sidebar: Income + Daily Entry
+# Sidebar with user info + logout
 with st.sidebar:
-    st.header(f"👋 {st.session_state.user_name}")
+    if user_picture:
+        st.image(user_picture, width=100, caption=user_id)
+    st.header(f"👋 {user_name}")
     
-    # Monthly Income
+    # Logout button
+    if st.button("🚪 Logout", use_container_width=True):
+        authenticator.logout()
+        st.cache_resource.clear()
+        st.rerun()
+    
+    # Monthly Income Setup
     st.header("💰 Monthly Income")
     col1, col2 = st.columns(2)
     with col1:
@@ -194,14 +122,14 @@ with st.sidebar:
         income_amt = st.number_input("Income (₹)", value=80000.0, min_value=0.0)
     
     if st.button("💾 Save Income", use_container_width=True):
-        inc_col = get_income_col(st.session_state.user_id)
+        inc_col = get_income_col(user_id)
         inc_col.replace_one({"month": month}, {
             "month": month, "amount": income_amt, "source": "Salary"
         }, upsert=True)
         st.success("✅ Income saved!")
         st.rerun()
     
-    # Daily Entry
+    # Daily Expense Entry
     st.header("📝 Daily Entry")
     with st.form("daily_entry"):
         exp_date = st.date_input("Date", value=date.today())
@@ -209,8 +137,8 @@ with st.sidebar:
         amount = st.number_input("Amount (₹)", min_value=0.0)
         desc = st.text_input("Description")
         is_income = st.checkbox("Income?")
-        if st.form_submit_button("➕ Add", use_container_width=True):
-            exp_col = get_expenses_col(st.session_state.user_id)
+        if st.form_submit_button("➕ Add Entry", use_container_width=True):
+            exp_col = get_expenses_col(user_id)
             exp_col.insert_one({
                 "date": datetime.combine(exp_date, datetime.min.time()),
                 "category": cat,
@@ -218,41 +146,47 @@ with st.sidebar:
                 "description": desc,
                 "is_income": is_income
             })
-            st.success("✅ Added!")
+            st.success("✅ Entry added!")
             st.rerun()
 
-# Dashboard Tabs
-tab1, tab2, tab3 = st.tabs(["📊 Overview", "📈 Charts", "📋 Entries"])
+# Main Dashboard Tabs
+tab1, tab2, tab3 = st.tabs(["📊 Overview", "📈 Charts", "📋 Recent Entries"])
 
 with tab1:
     col1, col2, col3, col4 = st.columns(4)
-    analytics = monthly_analytics(st.session_state.user_id, "2026-02")
+    analytics = monthly_analytics(user_id, "2026-02")
     
-    with col1: st.metric("Income", f"₹{analytics['monthly_income']:,.0f}")
-    with col2: st.metric("Expenses", f"₹{analytics['total_expenses']:,.0f}")
-    with col3: st.metric("Surplus", f"₹{analytics['surplus']:,.0f}")
-    with col4: st.metric("Savings %", f"{analytics['savings_rate']:.1f}%")
+    with col1:
+        st.metric("Income", f"₹{analytics['monthly_income']:,.0f}")
+    with col2:
+        st.metric("Expenses", f"₹{analytics['total_expenses']:,.0f}")
+    with col3:
+        st.metric("Surplus", f"₹{analytics['surplus']:,.0f}")
+    with col4:
+        st.metric("Savings %", f"{analytics['savings_rate']:.1f}%")
 
 with tab2:
-    exp_col = get_expenses_col(st.session_state.user_id)
+    exp_col = get_expenses_col(user_id)
     pipeline = [{"$group": {"_id": "$category", "total": {"$sum": "$amount"}}}]
     data = list(exp_col.aggregate(pipeline))
     
     if data:
         df = pd.DataFrame(data)
-        fig = px.pie(df, values='total', names='_id', title="Expense Breakdown")
+        fig = px.pie(df, values='total', names='_id', title="Expense Breakdown by Category")
         st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("👆 Add some expenses to see charts!")
 
 with tab3:
-    exp_col = get_expenses_col(st.session_state.user_id)
+    exp_col = get_expenses_col(user_id)
     expenses = list(exp_col.find({"date": {"$regex": "2026-02"}}).sort("date", -1).limit(50))
     if expenses:
         df_exp = pd.DataFrame(expenses)
-        df_exp['date'] = pd.to_datetime(df_exp['date'])
+        if 'date' in df_exp.columns:
+            df_exp['date'] = pd.to_datetime(df_exp['date'])
         st.dataframe(df_exp, use_container_width=True)
+    else:
+        st.info("👆 Start adding daily expenses!")
 
-# Logout
-if st.sidebar.button("🚪 Logout", use_container_width=True):
-    for key in ['user_id', 'user_name', 'user_picture', 'is_logged_in']:
-        del st.session_state[key]
-    st.rerun()
+st.markdown("---")
+st.caption("💰 Family Budget Tracker | Built for single earners | Deployed on Streamlit Cloud")
